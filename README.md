@@ -40,7 +40,10 @@ FedCAPE is an open-source framework for federated concept discovery and automate
 ├── README.md # Project documentation (this file)
 ├── thesis-fedcape # Main implementation file (Python)
 ```
-basicall python 3.12 is used.
+Basically Python 3.12 is used, and additionally, the following external items  :
+  - [SAM2](https://github.com/facebookresearch/segment-anything), 
+  - [CLIP](https://github.com/openai/CLIP), 
+  - [DINOv2](https://github.com/facebookresearch/dinov2),
 ps the dirctory names should match the class name.
 the Data is from Imagene Large Scale Visual Recognition Challenge 2012 (ILSVRC2012).  
 and the logit class nuron number https://gist.github.com/xkumiyu/dd200f3f51986888c9151df4f2a9ef30#file-ilsvrc2012_classlist-txt-L191 

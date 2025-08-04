@@ -12,7 +12,7 @@ FedCAPE is an open-source framework for federated concept discovery and automate
 - **HPC/large-scale support:** Parallel, batched computation and resource management for multi-node clusters.
 
 ## Repository Structure
-
+```
 ├── segment_dataset/
 │ └── segments/ # Per-client segment and metadata storage
 │     └── precomputed_client_0.pkl   -| 
@@ -39,7 +39,7 @@ FedCAPE is an open-source framework for federated concept discovery and automate
 ├── requirments.txt (for adjusting the virtual environment )
 ├── README.md # Project documentation (this file)
 ├── thesis-fed # Main implementation file (Python)
-
+```
 basicall python 3.12 is used.
 ps the dirctory names should match the class name.
 the Data is from Imagene Large Scale Visual Recognition Challenge 2012 (ILSVRC2012).  

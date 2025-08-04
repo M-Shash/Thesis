@@ -38,7 +38,7 @@ FedCAPE is an open-source framework for federated concept discovery and automate
 |       └──moving van
 ├── requirments.txt (for adjusting the virtual environment )
 ├── README.md # Project documentation (this file)
-├── thesis-fed # Main implementation file (Python)
+├── thesis-fedcape # Main implementation file (Python)
 ```
 basicall python 3.12 is used.
 ps the dirctory names should match the class name.

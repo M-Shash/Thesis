@@ -420,24 +420,229 @@ def visualize_clusters_with_overlay_and_arrow(clusters_by_class, max_per_cluster
 
         plt.tight_layout(rect=[0, 0.03, 1, 0.98])
         plt.show()
+
+class InceptionContext:
+    def __init__(self, device):
+        self.inception_model = inception_v3(weights='IMAGENET1K_V1').to(device)
+        self.inception_model.eval()
+        self.inception_features = {}
+        self.gradients = {}
+        self.inception_preproc = transforms.Compose([
+            transforms.Resize((299, 299)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        self.device = device
+
+        # Register hooks, binding self as closure via lambda or inner function
+        def hook_fn(module, input, output):
+            self.inception_features['mixed_8'] = output.detach()
+
+        def save_gradient(module, grad_input, grad_output):
+            self.gradients['mixed_8'] = grad_output[0]
+
+        self.inception_model.Mixed_7b.register_forward_hook(hook_fn)
+        self.inception_model.Mixed_7b.register_backward_hook(save_gradient)
+def extract_mixed8_features(segment_metas, context):
+    images = []
+    feats = []
+    for meta in segment_metas:
+        img_path = meta['img_path']
+        img = Image.open(img_path).convert('RGB')
+        img_tensor = context.inception_preproc(img)
+        images.append(img_tensor)
+    if not images:
+        return np.zeros((0, 1280))
+    batch_size = 512
+    for i in range(0, len(images), batch_size):
+        batch=torch.stack(images[i:i + batch_size]).to(context.device)
+        with torch.no_grad():
+            _ = context.inception_model(batch)
+            batch_feats = context.inception_features['mixed_8'].mean(dim=[2, 3])
+        feats.append(batch_feats.cpu().numpy())    
+        torch.cuda.empty_cache()
+    return np.concatenate(feats, axis=0)
+
+def get_mixed8_gradients_G(img, target_class_idx, context):
+    context.inception_features.clear()
+    context.gradients.clear()
+    tensor = context.inception_preproc(img).unsqueeze(0).to(context.device)
+    tensor.requires_grad_(True)
+    output = context.inception_model(tensor)
+    target_logit = output[:, target_class_idx]
+    context.inception_model.zero_grad()
+    target_logit.backward()
+    grad = context.gradients['mixed_8'].detach().cpu().numpy().squeeze()
+    grad_pooled = grad.mean(axis=(1,2))
+    return grad_pooled
+
+def compute_tcav_score_for_class_G(class_images, cav, target_class_idx, context):
+    pos = 0
+    for img in class_images:
+        grad_pooled = get_mixed8_gradients_G(img, target_class_idx, context)
+        grad_pooled = grad_pooled / np.linalg.norm(grad_pooled)
+        if np.dot(grad_pooled, cav) > 0:
+            pos += 1
+    return pos / len(class_images)
+    
+#def hook_fn(module, input, output):
+#        inception_features['mixed_8'] = output.detach()
+
+#def save_gradient(module, grad_input, grad_output):
+#        gradients['mixed_8'] = grad_output[0]
+
+#        inception_model.Mixed_7b.register_forward_hook(hook_fn)
+#        inception_model.Mixed_7b.register_backward_hook(save_gradient)
+
+#        inception_preproc = transforms.Compose([
+#            transforms.Resize((299, 299)),
+#            transforms.ToTensor(),
+#            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+#        ])
+
+#def extract_mixed8_features(segment_metas):
+#            images = []
+#            feats = []
+#            for meta in segment_metas:
+#                img_path = meta['img_path']
+#                img = Image.open(img_path).convert('RGB')
+#                img_tensor = inception_preproc(img)
+#                images.append(img_tensor)
+#            if not images:
+#                return np.zeros((0, 1280))
+#            batch_size = 512
+#            for i in range(0, len(images), batch_size):
+#                batch=torch.stack(images[i:i + batch_size]).to(self.device)
+#                with torch.no_grad():
+#                    _ = inception_model(batch)
+#                    batch_feats = inception_features['mixed_8'].mean(dim=[2, 3])
+#                feats.append(batch_feats.cpu().numpy())    
+#                torch.cuda.empty_cache()
+#            return np.concatenate(feats, axis=0)
+
+def calculate_cav(concept_features, random_features):
+            X = np.concatenate([concept_features, random_features], axis=0)
+            y = np.array([1]*len(concept_features) + [0]*len(random_features))
+            clf = LogisticRegression(max_iter=1000)
+            clf.fit(X, y)
+            cav = clf.coef_[0]
+            cav = cav / np.linalg.norm(cav)
+            mean_pos = np.mean(np.dot(concept_features, cav))
+            mean_neg = np.mean(np.dot(random_features, cav))
+            if mean_pos < mean_neg:
+                cav = -cav
+            return cav 
+
+#def get_mixed8_gradients_G(img, target_class_idx):
+#            inception_features.clear()
+#            gradients.clear()
+#            tensor = inception_preproc(img).unsqueeze(0).to(self.device)
+#            tensor.requires_grad_(True)
+#            output = inception_model(tensor)
+#            target_logit = output[:, target_class_idx]
+#            inception_model.zero_grad()
+#            target_logit.backward()
+#            grad = gradients['mixed_8'].detach().cpu().numpy().squeeze()
+#            grad_pooled = grad.mean(axis=(1,2))
+#            return grad_pooled
+
+#def compute_tcav_score_for_class_G(class_images, cav, target_class_idx):
+#            pos = 0
+#            for img in class_images:
+#                grad_pooled = get_mixed8_gradients_G(img, target_class_idx)
+#                grad_pooled = grad_pooled / np.linalg.norm(grad_pooled)
+#                if np.dot(grad_pooled, cav) > 0:
+#                    pos += 1
+#            return pos / len(class_images)
+
+def load_test_images_by_class_G(test_dir):
+            class_images = {}
+            for class_label in os.listdir(test_dir):
+                if class_label.startswith('.'):
+                    continue
+                class_path = os.path.join(test_dir, class_label)
+                if not os.path.isdir(class_path):
+                    continue
+                imgs = []
+                for fname in os.listdir(class_path):
+                    if fname.lower().endswith(('png', 'jpg', 'jpeg')):
+                        img = Image.open(os.path.join(class_path, fname)).convert('RGB')
+                        imgs.append(img)
+                class_images[class_label] = imgs
+            return class_images
+
+def plot_tcav_heatmap(tcav_matrix, class_labels, cluster_labels, client_id, out_dir="cluster_visualizations", concept_class="???"):
+            """
+            tcav_matrix: np.ndarray of shape (num_clusters, num_classes)
+            class_labels: list of class names (columns)
+            cluster_labels: list of cluster names/ids (rows)
+            client_id: client numeric id
+            out_dir: directory to save the output image
+            """
+            import matplotlib
+            import matplotlib.pyplot as plt
+            os.makedirs(out_dir, exist_ok=True)
+            fig, ax = plt.subplots(figsize=(1.2 * len(class_labels) + 2, 0.8 * len(cluster_labels) + 3))
+            cmap = matplotlib.colors.LinearSegmentedColormap.from_list('red_green', ['red', 'yellow', 'green'])
+            cax = ax.imshow(tcav_matrix, cmap=cmap, vmin=0., vmax=1.)
+
+            for i in range(tcav_matrix.shape[0]):
+                for j in range(tcav_matrix.shape[1]):
+                    val = tcav_matrix[i, j]
+                    ax.text(j, i, f"{val:.2f}", va='center', ha='center',
+                            color="black" if val < 0.5 else "white", fontsize=10, fontweight='bold')
+            ax.set_xticks(np.arange(len(class_labels)))
+            ax.set_yticks(np.arange(len(cluster_labels)))
+            ax.set_xticklabels(class_labels, rotation=45, ha="right", fontsize=12)
+            ax.set_yticklabels(cluster_labels, fontsize=12)
+            ax.set_xlabel("Class label")
+            ax.set_ylabel("Concept (Cluster)")
+            plt.title(f"TCAV class {concept_class} Concepts Contribution\nClient {client_id}", fontsize=15, pad=25)
+            plt.colorbar(cax, ax=ax, fraction=0.045)
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f"TCAV_heatmap_class_{concept_class}_client{client_id}.png"))
+            plt.close(fig)
 class FedKMeansStrategy(Strategy):
     def __init__(self, initial_centroids, num_clusters=10, tol=1e-3):
         self.global_centroids = initial_centroids
         self.num_clusters = num_clusters
         self.tol = tol
         self.converged = False
+        self.silhouette_history = defaultdict(lambda: defaultdict(list))
+        self.global_tcav_clients = set()
+        self.finished = False
+        self.global_cavs = None  
+        self.label_to_classname = {'basketball': 0, 'mountain bike': 1, 'moving van': 2}
 
     def initialize_parameters(self, client_manager):
         return ndarrays_to_parameters([])
 
     def configure_fit(self, server_round, parameters, client_manager):
+        config = {}
+        if getattr(self, "finished", False):
+            print("[Server] Simulation finished after global TCAV. No more rounds.")
+            return []
         print(f"[Strategy] configure_fit called for round {server_round}")
         print(f"[Strategy] Available clients: {len(client_manager.all())}")
         if len(client_manager.all()) == 0:
             return []
 
-        mode = "tcav" if self.converged else "cluster"
-        config = {"mode": mode}
+        if self.converged:
+        # Pass flags to indicate what client should do
+            #print (f" this is the global_CAV {self.global_cavs}")
+            if self.global_cavs:
+                print("[Server] Sending GLOBAL TCAV configs.")
+                config["mode"] = "tcav"
+                config["do_global_tcav"] = True  # Tell clients to run global TCAV
+                config["global_cavs"] = json.dumps(self.global_cavs)
+            else:
+                print("[Server] Sending LOCAL TCAV configs.")
+                config["mode"] = "tcav"
+                config["do_global_tcav"] = False  # Only run local TCAV
+        else:
+            print("[Server] Still in Clustering mode ")
+            config["mode"] = "cluster"
+        
         #if not self.converged:
         serialized = {int(k): v.tolist() for k, v in self.global_centroids.items()}
         config["centroids"] = json.dumps(serialized) 
@@ -447,19 +652,56 @@ class FedKMeansStrategy(Strategy):
         return [(client, fit_ins) for client in client_manager.all().values()]
 
     def aggregate_fit(self, server_round, results, failures):
+
         if failures:
             print(f"[Server] {len(failures)} client failures in round {server_round}:")
             for failure in failures:
                 print(f"  - Failure: {str(failure)}")
 
-        if self.converged or not results:
+        if self.converged :
             dummy = ndarrays_to_parameters([np.zeros((1, 1), dtype=np.float32)])
+            cavs_per_concept = defaultdict(list)  # (class_label, cluster_id) -> list of (cav, count)
+            for client_proxy, fit_res in results:
+                cav_results = fit_res.metrics.get("cav_results")
+                if cav_results is not None:
+                    cav_results = json.loads(cav_results)
+                    for key, value in cav_results.items():
+                        class_name, cluster_id = key.rsplit('_', 1)
+                        cluster_id = int(cluster_id)
+                        class_label = self.label_to_classname[class_name]
+                        cav = np.array(value['cav'])
+                        count = value['count']
+                        cavs_per_concept[(class_label, cluster_id)].append((cav, count))
+            global_cavs = {}
+            for (class_label, cluster_id), cav_list in cavs_per_concept.items():
+                total_count = sum(cnt for _, cnt in cav_list)
+                if total_count == 0:
+                    continue
+                weighted_cav = sum(cav * cnt for cav, cnt in cav_list) / total_count
+                weighted_cav = weighted_cav / np.linalg.norm(weighted_cav)
+                global_cavs[f"{class_label}_{cluster_id}"] = weighted_cav.tolist()
+            if global_cavs:  # Only set if we got CAVs!
+                self.global_cavs = global_cavs
+                print(f"[Server] Aggregated and set {len(global_cavs)} global CAVs for global TCAV phase.")
+            for client_proxy, fit_res in results:
+                    metrics = fit_res.metrics
+                    if metrics.get("global_tcav_ran"):
+                        self.global_tcav_clients.add(getattr(client_proxy, 'cid', str(client_proxy)))
+            if len(self.global_tcav_clients) == len(results):  # or num_clients if more robust
+                print("[Server] All clients finished global TCAV. Ending simulation.")
+                self.finished = True
             return dummy, {}
 
         all_cluster_data = []
         per_class_clusters = defaultdict(list)  # class_label -> list of (centroid, count)
         for client_proxy, fit_res in results:
             #cluster_data_json = fit_res.metrics.get("cluster_data")
+            client_id = getattr(client_proxy, 'cid', str(client_proxy))
+            avg_silhouette_scores = fit_res.metrics.get('avg_silhouette_scores')
+            if avg_silhouette_scores is not None:
+                avg_silhouette_scores = json.loads(avg_silhouette_scores)
+            for class_label, avg_sil in avg_silhouette_scores.items():
+                self.silhouette_history[client_id][int(class_label)].append(avg_sil)
             arrays = parameters_to_ndarrays(fit_res.parameters)
             #if cluster_data_json is None:
             #    continue
@@ -503,7 +745,17 @@ class FedKMeansStrategy(Strategy):
         if max_shift < self.tol:
             print("Convergence achieved. Switching to TCAV phase.")
             self.converged = True
-
+            for client_id in self.silhouette_history:
+                plt.figure(figsize=(8, 5))
+                for class_label in self.silhouette_history[client_id]:
+                    plt.plot(self.silhouette_history[client_id][class_label],label=f"Class {class_label}")
+                plt.xlabel("Round")
+                plt.ylabel("Average Silhouette Score")
+                plt.title(f"Client {client_id}: Avg. Silhouette Score per Class (Clustering Rounds)")
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(f"cluster_visualizations/silhouette_history_client{client_id}.png")
+                plt.close()
         dummy = ndarrays_to_parameters([np.zeros((1, 1), dtype=np.float32)])
         return dummy, {}
 
@@ -585,50 +837,10 @@ class ThesisKMeansClient(NumPyClient):
         class_feature_map = defaultdict(list)
         class_meta_map = defaultdict(list)
         self.tcav_ran =False
+        self.global_cav_received = False
     def get_parameters(self, config):
         return []
-        
-    #def save_state(self):
-    #    import pickle
-    #    from collections import defaultdict
 
-    #    state = {
-    #    "features": self.features,
-    #    "labels": self.labels,
-    #    "metas": self.metas,
-    #    "cluster_labels": getattr(self, "cluster_labels", None)#,
-    #    #"class_feature_map": self.class_feature_map,  
-    #    #"class_meta_map": self.class_meta_map,
-    #    }
-    #    with open(f"segment_dataset/segments/segments_client_{self.cid}/client_{self.cid}_state.pkl", "wb") as f:
-    #        pickle.dump(state, f)
-    #    print(f"[Client {self.cid}] State saved to disk.")
-    
-    #def load_state(self):
-    #    import pickle
-    #    state_file = f'segment_dataset/segments/segments_client_{self.cid}/client_{self.cid}_state.pkl'
-    #    if os.path.exists(state_file):
-    #        try:
-    #            with open(state_file, 'rb') as f:
-    #                if os.path.getsize(state_file) == 0:
-    #                    raise EOFError("State file is empty")
-    #                state = pickle.load(f)
-    #            self.features = state['features']
-    #            self.labels = state['labels']
-    #            self.metas = state['metas']
-                
-    #            print(f"[Client {self.cid}] State loaded from {state_file}")
-    #        except (EOFError, pickle.UnpicklingError) as e:
-    #            print(f"[Client {self.cid}] Failed to load state from {state_file}: {e}. Deleting corrupted file and starting fresh.")
-    #            os.remove(state_file)  # Remove bad file
-    #            self.features  = None
-    #            self.labels = None
-    #            self.metas = None
-    #    else:
-    #        print(f"[Client {self.cid}] No state file found; starting fresh")
-    #        self.features  = None
-    #        self.labels = None
-    #        self.metas = None
             
     def fit(self, parameters, config) -> tuple[list[np.ndarray], int, dict[str, float | int | str | bytes | bool]]:
         try:
@@ -637,11 +849,58 @@ class ThesisKMeansClient(NumPyClient):
             mode = config["mode"]
             
             if mode == "tcav":
-                #self.load_state()
-                if self.tcav_ran :
+                do_global_tcav = config.get("do_global_tcav", False)
+                metrics = {}
+                if do_global_tcav :
+        #=======================>>>>>>>>>>>>>>>>  Calculating the Global Concepts<<<<<<<<<<<<===========================
+                    #inception_features = {}
+                    #gradients = {}
+                    context = InceptionContext(self.device)
+                    global_cavs = json.loads(config["global_cavs"])
+                    test_dir = '/gpfs/helios/home/mahmouds/Thesis/Test'
+                    class_to_inception_idx = {
+                        'basketball': 816,
+                        'mountain bike': 162,
+                        'moving van': 191
+                            }
+                    test_images = load_test_images_by_class_G(test_dir) 
+                    Gclusters = list(global_cavs.keys())
+                    print (f"listing the Global_cav keys {Gclusters}")
+                    Gparsed_clusters = [tuple(map(int, key.split('_'))) for key in Gclusters]
+                    print (f"listing the Gparsed_clusters {Gparsed_clusters}")
+                    Gcluster_labels = [f"{self.label_to_classname.get(cl, cl)}-C{cid}" for cl, cid in Gparsed_clusters]
+                    print(f"Gcluster_labels {Gcluster_labels}")
+                    Gclass_labels = sorted(test_images.keys())
+                    print(f"Gclass_labels {Gclass_labels}")
+                    #unique_classes = sorted(set(cl for cl, _ in Gclusters))
+                    tcav_matrix = np.zeros((len(Gclusters), len(Gclass_labels)))
+                    for i, (class_label_int, cid) in enumerate(Gparsed_clusters):
+                        class_name = self.label_to_classname[class_label_int] 
+                        cav = np.array(global_cavs[f"{class_label_int}_{cid}"])
+                        for j, test_class in enumerate(Gclass_labels):
+                            if test_class not in test_images or class_name not in class_to_inception_idx:
+                                tcav_matrix[i, j] = np.nan
+                                continue
+                            score = compute_tcav_score_for_class_G(test_images[test_class], cav, class_to_inception_idx[test_class], context)
+                            tcav_matrix[i, j] = score
+                    print (f"Global TCAV Matrix:{tcav_matrix}")
+                    out_dir = "cluster_visualizations"
+                    for concept_class in set(cl for cl, _ in Gparsed_clusters):
+                        rows = [i for i, (cl, _) in enumerate(Gparsed_clusters) if cl == concept_class]
+                        if not rows:
+                            continue
+                        submatrix = tcav_matrix[rows, :]
+                        sub_cluster_labels = [Gcluster_labels[i] for i in rows]
+                        # Save heatmap, label it as "Global"
+                        plot_tcav_heatmap(submatrix, Gclass_labels, sub_cluster_labels, client_id=self.cid, out_dir=out_dir, concept_class=f"{self.label_to_classname.get(concept_class, concept_class)} (Global)")
+                        print(f"[Client {self.cid}] Saved **Global** TCAV class{concept_class} concepts heatmap to {out_dir}/TCAV_heatmap_class_{concept_class}_client{self.cid}_global.png")
+
+                    metrics = {"global_tcav_ran": True}
                     dummy_array = np.zeros((self.k, self.features.shape[1]), dtype=np.float32)
-                    return [dummy_array], 0, {}
-                self.tcav_ran= True
+                    return [dummy_array], 0, metrics
+            #=======================>>>>>>>>>>>>>>>> End of  Calculating the Global Concepts<<<<<<<<<<<<===========================
+                
+                metrics["tcav_ran"] = True
                 class_feature_map = defaultdict(list)
                 class_meta_map = defaultdict(list)
                 centroids_dict = json.loads(config["centroids"])
@@ -700,12 +959,14 @@ class ThesisKMeansClient(NumPyClient):
                 self.features = np.stack(all_features)                                                                               #
                 self.labels = np.array(all_labels)                                                                                   #
                 self.metas = all_metas                                                                                               #
-                self.train_cavs_and_tcav()
+                cav_results=self.train_cavs_and_tcav()
+                metrics["cav_results"] = json.dumps(cav_results)
                 dummy_array = np.zeros((self.k, self.features.shape[1]), dtype=np.float32)
-                return [dummy_array], 0, {}  # Return NDArrays (list of np.ndarray), int, dict
+                return [dummy_array], 0, metrics  # Return NDArrays (list of np.ndarray), int, dict
             
             if "centroids" not in config:
                 raise ValueError("Missing 'centroids' in config")
+            avg_silhouette_scores = {}
             centroids_dict = json.loads(config["centroids"])
             centroids_dict = {int(k): np.array(v, dtype=np.float32) for k, v in centroids_dict.items()}
             class_feature_map = defaultdict(list)
@@ -720,24 +981,29 @@ class ThesisKMeansClient(NumPyClient):
                 if class_label not in centroids_dict:
                     print(f"[Client {self.cid}]: Skipping class {class_label} (no centroids from server)")
                     continue
-                print(f"== [Client {self.cid}] CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
+                #print(f"== [Client {self.cid}] CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
                 features_class = np.stack(class_feature_map[class_label])
-                print(f"== [Client {self.cid}] CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
+                #print(f"== [Client {self.cid}] CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
                 metas_class = class_meta_map[class_label]
-                print(f"== [Client {self.cid}] CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
+                #print(f"== [Client {self.cid}] CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
                 k = centroids_dict[class_label].shape[0]
                 centroids = centroids_dict[class_label]
                 print(f"\n[Client {self.cid}]  Class {class_label}: {features_class.shape[0]} segments")
-                print(f"== [Client {self.cid}] CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
+                #print(f"== [Client {self.cid}] CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
                 if features_class.shape[0] < k:
                     print(f"[Client {self.cid}] Skipping class {class_label} due to insufficient samples for clustering")
                     continue
                 print(f"[client {self.cid}] start the Kmean-Clustering  ")
-                print(f"== [Client {self.cid}] before Kmeans CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
+                #print(f"== [Client {self.cid}] before Kmeans CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
                 kmeans = KMeans(n_clusters=k, init=centroids, n_init=1, max_iter=1, algorithm="elkan", random_state=42)
                 kmeans.fit(features_class)
                 cluster_labels = kmeans.labels_
                 centers = kmeans.cluster_centers_
+                if len(np.unique(cluster_labels)) > 1:
+                    avg_sil = silhouette_score(features_class, cluster_labels)
+                else:
+                    avg_sil = -1.0
+                avg_silhouette_scores[class_label] = float(avg_sil)
                 #for meta, cid in zip(metas_class, cluster_labels):
                 #    meta['cluster_id'] = int(cid)                    
                 print(f"== [Client {self.cid}] CUDA: After Kmeans allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
@@ -756,7 +1022,7 @@ class ThesisKMeansClient(NumPyClient):
             cluster_indices = []
             for class_label, cluster_list in per_class_cluster_data.items():
                 for cluster_idx, entry in enumerate(cluster_list):
-                    centroids.append(entry["centroid"])     # Should already be list/np.ndarray
+                    centroids.append(entry["centroid"])    
                     counts.append(entry["count"])
                     class_labels.append(class_label)
                     cluster_indices.append(cluster_idx)
@@ -774,7 +1040,7 @@ class ThesisKMeansClient(NumPyClient):
             
             tot_samples = sum([len(class_feature_map[c]) for c in per_class_cluster_data])
             print(f"== [Client {self.cid}] After saving the state and preparing the Eval cycle parameters CUDA: allocated {torch.cuda.memory_allocated() // (1024*1024)} MB, reserved {torch.cuda.memory_reserved() // (1024*1024)} MB")
-            return [centroids_array, counts_array, class_labels_array, cluster_indices_array], tot_samples, {}  
+            return [centroids_array, counts_array, class_labels_array, cluster_indices_array], tot_samples, {"avg_silhouette_scores": json.dumps(avg_silhouette_scores)}  
         except Exception as e:
             import traceback
             print("❌ ERROR in client `fit()`:")
@@ -827,8 +1093,10 @@ class ThesisKMeansClient(NumPyClient):
             class_inertia[class_label] = float(inertia)
             # Cluster sizes
             sizes = np.bincount(assignments, minlength=k)
+            
             class_cluster_sizes[class_label] = {int(idx): int(sz) for idx, sz in enumerate(sizes)}
             total_samples += len(features_class)
+        
         metrics = {
             "inertia": float(inertia),
             "cluster_sizes": json.dumps(class_cluster_sizes)
@@ -1041,7 +1309,7 @@ class ThesisKMeansClient(NumPyClient):
 
         inception_features = {}
         gradients = {}
-        
+        metrics = {}
         def hook_fn(module, input, output):
             inception_features['mixed_8'] = output.detach()
 
@@ -1208,6 +1476,7 @@ class ThesisKMeansClient(NumPyClient):
 
         # Construct cluster CAVs
         cluster_cavs = {}
+        cav_results = {}    
         for class_label, clusters in clusters_by_class.items():
             for cluster, info in clusters:
                 cid = info['cluster_id']
@@ -1223,8 +1492,12 @@ class ThesisKMeansClient(NumPyClient):
                 neg_feats = extract_mixed8_features(neg_samples)
                 cav = calculate_cav(pos_feats, neg_feats)
                 cluster_cavs[(class_label, cid)] = cav
-                #### --------   I need to show a statment of the constructed CAV --------####
+                cav_results[f"{class_label}_{cid}"] = {
+                    "cav": cav.tolist(),
+                    "count": len(cluster)}
+                metrics["cav_results"] = json.dumps(cav_results)
             print(f"all the related CAV of Class {class_label} was successfully generated : \n {cluster_cavs} \n")
+          
         test_dir = '/gpfs/helios/home/mahmouds/Thesis/Test'
         image_dir= '/gpfs/helios/home/mahmouds/Thesis/data/ILSVRC2012/segmentation'
         class_to_inception_idx = {
@@ -1247,7 +1520,7 @@ class ThesisKMeansClient(NumPyClient):
         clusters = list(cluster_cavs.keys())
         cluster_labels = [f"{self.label_to_classname.get(cl, cl)}-C{cid}" for cl, cid in clusters]
         class_labels = sorted(test_images.keys())
-
+        unique_classes = sorted(set(cl for cl, _ in clusters))
         # Initialize the matrix
         tcav_matrix = np.zeros((len(clusters), len(class_labels)))
 
@@ -1274,7 +1547,10 @@ class ThesisKMeansClient(NumPyClient):
             #plot_tcav_heatmap(tcav_matrix, class_labels, cluster_labels, client_id=self.cid)
             plot_tcav_heatmap(submatrix, class_labels, sub_cluster_labels, client_id=self.cid, out_dir="cluster_visualizations",concept_class=concept_class)
             print(f"[Client {self.cid}] Saved TCAV class{concept_class} concepts heatmap to cluster_visualizations/TCAV_heatmap_client{self.cid}.png")
-
+        dummy_array = np.zeros((self.k, self.features.shape[1]), dtype=np.float32)
+        #print(f"this is the metrics after the local cav: {metrics}")
+        return cav_results
+    
 #! export RAY_LOG_TO_STDERR=1
 #logging.basicConfig(level=logging.INFO)
 #logger = logging.getLogger(__name__)
@@ -1323,52 +1599,52 @@ def precompute_client_data(num_clients=3):
         #logger.info(f"Precomputing for client {cid}...")
         segment_root = f'segment_dataset/segments/segments_client_{cid}'
         os.makedirs(segment_root, exist_ok=True)
-        client_features, client_labels, client_metas = [], [], []
-        for img_idx, (image_tensor, label) in tqdm(enumerate(imagenet_dataset), total=len(imagenet_dataset)):
-            if img_idx % num_clients != cid:
-                continue
+        #client_features, client_labels, client_metas = [], [], []
+        #for img_idx, (image_tensor, label) in tqdm(enumerate(imagenet_dataset), total=len(imagenet_dataset)):
+        #    if img_idx % num_clients != cid:
+        #        continue
 
-            orig_img_path, _ = imagenet_dataset.samples[img_idx]
-            img_pil = Image.open(orig_img_path).convert("RGB")
-            img_np = np.array(img_pil)
+        #    orig_img_path, _ = imagenet_dataset.samples[img_idx]
+        #    img_pil = Image.open(orig_img_path).convert("RGB")
+        #    img_np = np.array(img_pil)
             
-            try:
-                masks = mask_gen.generate(img_np)
-                if not masks or len(masks) == 0:
-                    print(f"[Client {cid}] ⚠️ No masks returned for image {img_idx}: {orig_img_path}")
-                    continue    
-            except Exception as e:
-                print(f"[Client {cid}] Segmentation failed on image {orig_img_path}: {e}")
-                continue
+        #    try:
+        #        masks = mask_gen.generate(img_np)
+        #        if not masks or len(masks) == 0:
+        #            print(f"[Client {cid}] ⚠️ No masks returned for image {img_idx}: {orig_img_path}")
+        #            continue    
+        #    except Exception as e:
+        #        print(f"[Client {cid}] Segmentation failed on image {orig_img_path}: {e}")
+        #        continue
 
-            segments, scores, bboxes = [], [], []
-            for m in masks:
-                mask = m["segmentation"].astype(bool)
-                seg = img_np.copy()
-                seg[~mask] = 0
-                segments.append(seg)
-                scores.append(m["predicted_iou"])
-                bboxes.append(get_bbox_from_mask(mask))
+        #    segments, scores, bboxes = [], [], []
+        #    for m in masks:
+        #        mask = m["segmentation"].astype(bool)
+        #        seg = img_np.copy()
+        #        seg[~mask] = 0
+        #        segments.append(seg)
+        #        scores.append(m["predicted_iou"])
+        #        bboxes.append(get_bbox_from_mask(mask))
 
-            class_name = imagenet_dataset.classes[label]
-            class_dir = os.path.join(segment_root, class_name)
+        #    class_name = imagenet_dataset.classes[label]
+        #    class_dir = os.path.join(segment_root, class_name)
 
-            save_segments_with_metadata(
-                img_idx, label, segments, scores, bboxes, orig_img_path, class_dir, score_threshold=0.65
-            )
+        #    save_segments_with_metadata(
+        #        img_idx, label, segments, scores, bboxes, orig_img_path, class_dir, score_threshold=0.65
+        #    )
 
         print(f"[Client {cid}] Segmentation done. Starting feature extraction...")
             
         
-        segment_dataset = SegmentDataset(segment_root=segment_root, transform=dino_transform)
-        print(segment_dataset.get_stats())
-        segment_loader = DataLoader(segment_dataset, batch_size=512, shuffle=False, collate_fn=custom_collate)
+        #segment_dataset = SegmentDataset(segment_root=segment_root, transform=dino_transform)
+        #print(segment_dataset.get_stats())
+        #segment_loader = DataLoader(segment_dataset, batch_size=512, shuffle=False, collate_fn=custom_collate)
         
-        features, labels, metas = extract_features_dinov2(segment_loader, dinov2_model, device)
-        print(f"[Client {cid}] Extracted features: {features.shape}, Labels: {len(labels)}")
-        data = {'features': features, 'labels': labels, 'metas': metas}
-        with open(f'segment_dataset/segments/precomputed_client_{cid}.pkl', 'wb') as f:
-                pickle.dump(data, f)
+        #features, labels, metas = extract_features_dinov2(segment_loader, dinov2_model, device)
+        #print(f"[Client {cid}] Extracted features: {features.shape}, Labels: {len(labels)}")
+        #data = {'features': features, 'labels': labels, 'metas': metas}
+        #with open(f'segment_dataset/segments/precomputed_client_{cid}.pkl', 'wb') as f:
+        #        pickle.dump(data, f)
         logging.info(f"Precomputed data saved for client {cid}.")
     
 if __name__ == "__main__":
@@ -1451,4 +1727,3 @@ if __name__ == "__main__":
             "ftfy", "regex", "tqdm", "Pillow"
 ]}}
     )
-    

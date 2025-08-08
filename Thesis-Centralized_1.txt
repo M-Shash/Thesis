@@ -1,0 +1,1043 @@
+import torch
+from torch.utils.data import DataLoader,Dataset, Subset
+from torchvision.datasets import ImageFolder
+from torchvision import transforms,datasets
+from torchvision.models import  inception_v3
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision.transforms import ToPILImage
+from PIL import Image, ImageDraw
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.linear_model import LogisticRegression
+from scipy.spatial.distance import euclidean
+from collections import defaultdict, Counter
+import random
+import uuid
+import warnings
+import json
+import matplotlib.pyplot as plt
+import umap.umap_ as UMAP
+from sklearn.decomposition import PCA
+from kneed import KneeLocator
+import os
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import normalize
+from scipy.stats import skew, kurtosis
+from collections import defaultdict
+import numpy as np
+import math 
+import cv2 ,sys
+from sklearn.cluster import AgglomerativeClustering
+from tqdm import tqdm
+import clip as clip
+import torch.multiprocessing as mp
+mp.set_start_method('spawn', force=True)
+from itertools import chain
+import pickle  
+import matplotlib.cm as cm 
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+def ensure_pil(img):
+    if not isinstance(img, Image.Image):
+        img = Image.fromarray(img)
+    return img
+
+def clip_filter_segment(seg_img_pil):
+    
+    img_clip = clip_preprocess(seg_img_pil).unsqueeze(0).to(device)
+    with torch.no_grad():
+        image_feature = clip_model.encode_image(img_clip)
+        image_feature /= image_feature.norm(dim=-1, keepdim=True)
+        similarity = (100.0 * image_feature @ text_features.T)
+        probs = similarity.softmax(dim=-1)
+        topk = 2
+        top_scores, top_indices = torch.topk(probs, k=topk, dim=-1)
+        #best_idx = probs.argmax(dim=-1).item()
+        clip_scores = [s.item() for s in top_scores[0]]
+        class_names = [target_classes[i] for i in top_indices[0].tolist()]
+        # Empirical threshold to reduce false positives
+        #threshold = 0.5
+        return class_names, clip_scores# if clip_score >= threshold else (None, clip_score)    
+
+
+
+dino_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+def custom_collate(batch):
+    batch = [item for item in batch if item is not None and all(e is not None for e in item)]
+    if not batch:
+        return torch.empty(0), torch.empty(0), []
+    images, labels, metas = zip(*batch)
+    images = torch.stack(images)
+    labels = torch.stack(labels)
+    metas = list(metas)
+    return images, labels, metas
+@torch.no_grad()
+def extract_features_dinov2(dataloader, model, device="cuda"):
+    try:
+        features, labels_all, metas_all = [], [], []
+        for imgs, labels, meta_batch in tqdm(dataloader, desc="Extracting DINOv2 features"):
+            if imgs.size(0) == 0:
+                continue 
+            imgs = imgs.to(device)
+            feats = model(imgs).cpu()
+            features.append(feats)
+            labels_all.append(labels)
+            metas_all.extend(meta_batch)
+        features = torch.cat(features)
+        labels_all = torch.cat(labels_all)
+        return features, labels_all, metas_all
+    except Exception as e:
+        print(f"Client can't extract the Dino features because of : {e}")
+        # Return empty or None values explicitly to avoid implicit None
+        return torch.empty(0), torch.empty(0), []
+class SegmentDataset(Dataset):
+    def __init__(self, segment_root, transform):
+        self.samples = []
+        self.metadata = []
+        self.total_segments = 0
+        self.clip_filtered_out = 0
+        self.transform = transform
+
+        for class_name in sorted(os.listdir(segment_root)):
+            meta_path = os.path.join(segment_root, class_name, "metadata.json")
+            if not os.path.exists(meta_path):
+                print(f"[DEBUG] Metadata json missing for class: {class_name}")
+                continue
+
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+
+            for entry in meta:
+                img_path = os.path.join(segment_root, class_name, entry["segment_id"])
+                if not os.path.exists(img_path):
+                    print(f"[DEBUG] Missing segment image file: {img_path}")
+                    continue
+
+                self.total_segments += 1
+
+                # Do filtering at init time
+                try:
+                    pil_img = Image.open(img_path).convert("RGB")
+                    top_classes, top_scores = clip_filter_segment(pil_img)
+                    valid_clip_classes = DATASET_TO_CLIP.get(class_name, set())
+                    valid_clip_classes_lower = {c.lower() for c in valid_clip_classes}
+                    accepted = False
+                    original_class = class_name
+                    for c, s in zip(top_classes, top_scores):
+                        if c.lower() in valid_clip_classes_lower and s >= 0.5:
+                            clip_class = c
+                            clip_score = s
+                            accepted = True
+                            break
+                    if not accepted:
+                       self.clip_filtered_out += 1
+                       continue
+                    if clip_class is None:
+                        self.clip_filtered_out += 1
+                        continue  # skip this sample
+                    
+                        
+                    entry.update({
+                        "class_name": class_name,
+                        "img_path": img_path,
+                        "clip_class": clip_class,
+                        "clip_score": clip_score
+                    })
+                    self.samples.append(img_path)
+                    self.metadata.append(entry)
+                except Exception as e:
+                    print(f"[ERROR] Failed filtering {img_path}: {e}")
+                    self.clip_filtered_out += 1
+                    continue
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path = self.samples[idx]
+        meta = self.metadata[idx]
+        img = Image.open(img_path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        label = torch.tensor(meta["original_label"])
+        return img, label, meta
+
+    def get_stats(self):
+        return {
+            "total_attempted": self.total_segments,
+            "clip_filtered_out": self.clip_filtered_out,
+            "clip_passed": len(self.samples)
+        }
+def numpy_to_native(obj):
+    if isinstance(obj, dict):
+        return {k: numpy_to_native(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [numpy_to_native(i) for i in obj]
+    elif isinstance(obj, tuple):
+        return [numpy_to_native(i) for i in obj]  # Convert tuples to lists for JSON
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    else:
+        return obj
+        
+def get_bbox_from_mask(mask):
+    ys, xs = np.where(mask)
+    if len(xs) == 0 or len(ys) == 0:
+        return None  # skip empty mask
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+    return (x0, y0, x1, y1)
+    
+
+def save_segments_with_metadata(image_id, original_label, segments, scores,bboxes, orig_img_path,output_dir, score_threshold):
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = []
+
+    for i, (segment, score, bboxes) in enumerate(zip(segments, scores, bboxes)):
+        if score < score_threshold:
+            continue
+
+        original_name = os.path.splitext(os.path.basename(orig_img_path))[0]
+        seg_filename = f"{original_name}_{i}.png"
+        seg_path = os.path.join(output_dir, seg_filename)
+        Image.fromarray(segment).save(seg_path)
+
+        metadata.append({
+            "segment_id": seg_filename,
+            "original_label": int(original_label),
+            "original_image_index": int(image_id),
+            "score": float(score),
+            "bbox": bboxes,
+            "original_image_path": orig_img_path
+        })
+
+    meta_path = os.path.join(output_dir, "metadata.json")
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            existing_metadata = json.load(f)
+        existing_metadata.extend(metadata)
+        metadata = existing_metadata
+
+    with open(meta_path, "w") as f:
+        json.dump(numpy_to_native(metadata), f, indent=2)
+
+    return meta_path
+def denormalize(tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+    mean = torch.tensor(mean, dtype=tensor.dtype, device=tensor.device).view(-1,1,1)
+    std = torch.tensor(std, dtype=tensor.dtype, device=tensor.device).view(-1,1,1)
+    return tensor * std + mean
+
+def crop_to_foreground(img_np, bg_val=0, margin=4):
+    # Assumes background is black (0)
+    mask = np.any(img_np != bg_val, axis=-1)
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return img_np
+    y0, x0 = np.maximum(coords.min(axis=0) - margin, 0)
+    y1, x1 = np.minimum(coords.max(axis=0) + 1 + margin, img_np.shape[:2])
+    return img_np[y0:y1, x0:x1]
+
+
+def resize_with_aspect(img_np, max_size=(128, 128)):
+    img_pil = Image.fromarray(img_np if img_np.max() > 1 else (img_np * 255).astype('uint8'))
+    img_pil = img_pil.convert("RGB")
+    img_pil.thumbnail(max_size, Image.LANCZOS)
+    return np.asarray(img_pil)
+
+def visualize_cluster_segments(cluster_meta_list, cluster_id, max_visualize=5):
+    plt.figure(figsize=(15, 3))
+    plt.suptitle(f"Cluster {cluster_id}, Size: {len(cluster_meta_list)}", fontsize=16, y=1.08)
+    for i, meta in enumerate(cluster_meta_list[:max_visualize]):
+        img_path = meta["img_path"]
+        try:
+            img = Image.open(img_path).convert('RGB')
+            img_np = np.array(img)
+            img_np_cropped = crop_to_foreground(img_np)
+            img_np_display = resize_with_aspect(img_np_cropped, max_size=(128,128))
+            plt.subplot(1, max_visualize, i+1)
+            plt.imshow(img_np_display)
+            plt.axis('off')
+            plt.title(f"Cls: {meta['original_label']}\nScore: {meta['score']:.2f}\nImgID: {meta['original_image_index']}\n Clip class: {meta['clip_class']}")
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
+            plt.subplot(1, max_visualize, i+1)
+            plt.text(0.5, 0.5, 'Image Error', ha='center', va='center')
+            plt.axis('off')
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+	
+# DEBUG HELPERS
+def log(msg):
+    print(f"\n[DEBUG] {msg}")
+
+
+
+def plot_cluster_4x4(cluster, cluster_id, class_label):
+        # Ensure output directory exists
+        out_dir = "cluster_visualizations/centralized/"
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Build an informative, safe filename
+        fname = f"class_{class_label}_cluster_{cluster_id}.png"
+        save_path = os.path.join(out_dir, fname)
+        print(f"Saving: {fname} | Class label: {class_label}, Cluster size: {len(cluster)}")
+        fig = plt.figure(figsize=(12, 12))
+        plt.suptitle(f"Class {class_label} | Cluster {cluster_id} | {len(cluster)} items")
+        for i, meta in enumerate(cluster[:16]):
+            plt.subplot(4, 4, i + 1)
+            img = Image.open(meta['img_path']).convert("RGB")
+            plt.imshow(img)
+            plt.axis('off')
+            plt.title(
+            f"ImgID: {meta['original_image_index']}\n"
+            f"Score: {meta['clip_score']:.2f}\n"
+            f"Clip class: {meta['clip_class']}", fontsize=8
+            )
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close(fig)
+        
+def draw_arrow_on_image( ax, xy_from, xy_to, color='yellow', width=2, mutation_scale=15):
+        """Draws an arrow from xy_from to xy_to on a matplotlib axis."""
+        ax.annotate(
+            '', xy=xy_to, xytext=xy_from,
+            arrowprops=dict(
+                arrowstyle='->',
+                color=color,
+                lw=width,
+                shrinkA=0,
+                shrinkB=0,
+                mutation_scale=mutation_scale
+            ),
+            annotation_clip=False
+        )
+
+def create_mask_overlay_from_original( original_img_path, mask_img, alpha=0.6, mask_color=(255, 180, 0)):
+        """ Overlay a binary mask onto the original full image."""
+        import cv2  # Ensure cv2 is imported at top if not
+        orig = np.array(Image.open(original_img_path).convert("RGB")).copy()
+        mask = np.array(mask_img)
+        if mask.max() > 1:
+           mask_bin = (mask[..., 0] > 0).astype(np.uint8)
+        else:
+            mask_bin = mask[..., 0]
+        mask_rgb = np.zeros_like(orig)
+        mask_rgb[mask_bin == 1] = mask_color
+        out = cv2.addWeighted(mask_rgb, alpha, orig, 1 - alpha, 0)
+        return Image.fromarray(out)
+
+def extract_features_dinov2_from_metas(self, metas, batch_size=256):
+        img_tensors = []
+        feats_accum = []
+        for i, meta in enumerate(metas):
+            img = Image.open(meta['img_path']).convert("RGB")
+            img_tensor = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ])(img)
+            img_tensors.append(img_tensor)
+            if len(img_tensors) == batch_size or (i == len(metas) - 1):
+                batch = torch.stack(img_tensors).to(self.device)
+                with torch.no_grad():
+                        feats = self.dinov2(batch).cpu().numpy()
+                feats_accum.extend(feats)
+                del batch
+                torch.cuda.empty_cache()
+                img_tensors = []
+        return feats_accum
+def visualize_clusters_with_overlay_and_arrow( clusters_by_class, max_per_cluster=4):
+        """ Visualizes each cluster with segment (left) and overlay on original image (right), with arrow."""
+        for class_name, cluster_info_list in clusters_by_class.items():
+            n_clusters = len(cluster_info_list)
+            fig, axes = plt.subplots(n_clusters, max_per_cluster, figsize=(5 * max_per_cluster, 4 * n_clusters))
+            if n_clusters == 1:
+                axes = np.expand_dims(axes, 0)
+            plt.suptitle(f"Class: {class_name} Clusters (sorted by CLIP saliency)", fontsize=16)
+
+            for r, (cluster, info) in enumerate(cluster_info_list):
+                for c in range(max_per_cluster):
+                    ax = axes[r, c] if n_clusters > 1 else axes[0, c]
+                    try:
+                        meta = cluster[c]
+                    except IndexError:
+                        ax.axis('off')
+                        continue
+
+                # Load the segment image as saved (RGB)
+                    seg_img = Image.open(meta['img_path']).convert("RGB")
+                    seg_np = np.array(seg_img)
+
+                # Derive binary mask (used only for overlay)
+                    import cv2
+                    gray = cv2.cvtColor(seg_np, cv2.COLOR_RGB2GRAY)
+                    mask_only = np.where(gray > 5, 255, 0).astype(np.uint8)
+                    mask_only = np.expand_dims(mask_only, axis=-1)
+
+                # Load the original image and create overlay
+                    orig_img_path = meta.get('original_image_path')  # Assume this field exists in meta
+                    overlay_img = create_mask_overlay_from_original(orig_img_path, mask_only, alpha=0.6)
+
+                # Resize both views
+                    thumb_segment = seg_img.resize((64, 64), Image.LANCZOS)
+                    thumb_overlay = overlay_img.resize((128, 128), Image.LANCZOS)
+
+                # Compose side-by-side image
+                    combined = Image.new('RGB', (thumb_segment.width + thumb_overlay.width, thumb_overlay.height), (255, 255, 255))
+                    combined.paste(thumb_segment, (0, 0))
+                    combined.paste(thumb_overlay, (thumb_segment.width, 0))
+
+                # Show in subplot
+                    ax.imshow(combined)
+                    ax.axis('off')
+
+                # Draw arrow between segment and overlay
+                    arrow_start = (thumb_segment.width // 2, thumb_overlay.height // 2)
+                    arrow_end = (thumb_segment.width + thumb_overlay.width // 2, thumb_overlay.height // 2)
+                    draw_arrow_on_image(ax, arrow_start, arrow_end)
+
+                # Add title with cluster info
+                    ax.set_title(f"CID: {info['cluster_id']} | Score: {meta['clip_score']:.2f} \n Clip Interpretation: {meta['clip_class']}", fontsize=9)
+
+            plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+            plt.savefig(f"cluster_visualizations/centralized/Class{class_name}_cluster_segment_overlay_images.png")
+            plt.close(fig)
+			
+#def visualize_clusters_umap_3d( structured_clusters):
+#        for class_label, clusters in structured_clusters.items():
+#            all_feats = []
+#            all_labels = []
+#            for cluster, info in clusters:
+#                cluster_feats = [f for f in extract_features_dinov2_from_metas(cluster)]
+#                cluster_id = info['cluster_id']
+#                all_feats.extend(cluster_feats)
+#                all_labels.extend([cluster_id] * len(cluster_feats))
+
+#            if len(set(all_labels)) < 2:
+#                continue
+
+#            reducer = umap.UMAP(n_components=3, random_state=42)
+#            reduced = reducer.fit_transform(np.array(all_feats))
+   
+#            all_labels = np.array(all_labels)
+#            fig = plt.figure(figsize=(10, 8))
+#            ax = fig.add_subplot(111, projection='3d')
+#            colors = cm.get_cmap('tab10', np.max(all_labels)+1)
+#            for cluster_id in np.unique(all_labels):
+#                idx = all_labels == cluster_id
+#                ax.scatter(reduced[idx, 0], reduced[idx, 1], reduced[idx, 2],
+#                           label=f"Cluster {cluster_id}", alpha=0.6, s=30,
+#                           color=colors(cluster_id))
+#            ax.set_title(f"3D UMAP of Class '{class_label}' by Cluster")
+#            ax.legend()
+#            ax.view_init(elev=20, azim=135)
+#            plt.tight_layout()
+#            plt.savefig(f"cluster_visualizations/centralized/UMAP3D_{class_label}.png")
+#            plt.close(fig)
+def visualize_clusters_umap_3d(clusters_by_class, features_by_class):
+    for class_label, clusters in clusters_by_class.items():
+        feats, labels = [], []
+        for cluster_id, cluster in enumerate(clusters):
+            feats.extend(features_by_class[class_label][cluster_id])
+            labels.extend([cluster_id] * len(features_by_class[class_label][cluster_id]))
+        if len(set(labels)) < 2:
+            continue
+        reducer = umap.UMAP(n_components=3, random_state=42)
+        reduced = reducer.fit_transform(np.array(feats))
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        for cluster_id in np.unique(labels):
+            idx = np.array(labels) == cluster_id
+            ax.scatter(reduced[idx, 0], reduced[idx, 1], reduced[idx, 2], label=f"Cluster {cluster_id}", alpha=0.6)
+        ax.legend()
+        plt.savefig(f"UMAP3D_{class_label}.png")
+        plt.close(fig)			
+#def plot_tcav_heatmap(tcav_matrix, class_labels, cluster_labels, client_id, out_dir="cluster_visualizations", concept_class="???"):
+#            """
+#            tcav_matrix: np.ndarray of shape (num_clusters, num_classes)
+#            class_labels: list of class names (columns)
+#            cluster_labels: list of cluster names/ids (rows)
+#            client_id: client numeric id
+#            out_dir: directory to save the output image
+#            """
+#            import matplotlib
+#            import matplotlib.pyplot as plt
+#            os.makedirs(out_dir, exist_ok=True)
+#            fig, ax = plt.subplots(figsize=(1.2 * len(class_labels) + 2, 0.8 * len(cluster_labels) + 3))
+#            cmap = matplotlib.colors.LinearSegmentedColormap.from_list('red_green', ['red', 'yellow', 'green'])
+#            cax = ax.imshow(tcav_matrix, cmap=cmap, vmin=0., vmax=1.)
+
+#            for i in range(tcav_matrix.shape[0]):
+#                for j in range(tcav_matrix.shape[1]):
+#                    val = tcav_matrix[i, j]
+#                    ax.text(j, i, f"{val:.2f}", va='center', ha='center',
+#                            color="black" if val < 0.5 else "white", fontsize=10, fontweight='bold')
+#            ax.set_xticks(np.arange(len(class_labels)))
+#            ax.set_yticks(np.arange(len(cluster_labels)))
+#            ax.set_xticklabels(class_labels, rotation=45, ha="right", fontsize=12)
+#            ax.set_yticklabels(cluster_labels, fontsize=12)
+#            ax.set_xlabel("Class label")
+#            ax.set_ylabel("Concept (Cluster)")
+#            plt.title(f"TCAV class {concept_class} Concepts Contribution\nClient {client_id}", fontsize=15, pad=25)
+#            plt.colorbar(cax, ax=ax, fraction=0.045)
+#            plt.tight_layout()
+#            plt.savefig(os.path.join(out_dir, f"TCAV_heatmap_class_{concept_class}_client{client_id}.png"))
+#            plt.close(fig)
+def plot_tcav_heatmap(tcav_matrix, class_labels, cluster_labels, concept_class):
+    fig, ax = plt.subplots(figsize=(1.2 * len(class_labels) + 2, 0.8 * len(cluster_labels) + 3))
+    cax = ax.imshow(tcav_matrix, cmap='RdYlGn', vmin=0., vmax=1.)
+    for i in range(tcav_matrix.shape[0]):
+        for j in range(tcav_matrix.shape[1]):
+            ax.text(j, i, f"{tcav_matrix[i, j]:.2f}", va='center', ha='center', color="black" if tcav_matrix[i, j] < 0.5 else "white")
+    ax.set_xticks(np.arange(len(class_labels)))
+    ax.set_yticks(np.arange(len(cluster_labels)))
+    ax.set_xticklabels(class_labels, rotation=45, ha="right")
+    ax.set_yticklabels(cluster_labels)
+    plt.colorbar(cax, ax=ax)
+    plt.savefig(f"TCAV_heatmap_class_{concept_class}.png")
+    plt.close(fig)
+    
+def plot_silhouette(features, labels, class_label):
+    score = silhouette_score(features, labels)
+    plt.figure()
+    plt.title(f"Silhouette Score for class {class_label}: {score:.2f}")
+    plt.bar([0], [score])
+    plt.ylim(0, 1)
+    plt.savefig(f"cluster_visualizations/centralized/silhouette_{class_label}.png")
+    plt.close()
+
+def calculate_cav(concept_features, random_features):
+    X = np.concatenate([concept_features, random_features], axis=0)
+    y = np.array([1]*len(concept_features) + [0]*len(random_features))
+    clf = LogisticRegression(max_iter=1000)
+    clf.fit(X, y)
+    return clf.coef_[0] / np.linalg.norm(clf.coef_[0])
+    
+def save_gradient(module, grad_input, grad_output):
+    gradients['mixed_8'] = grad_output[0] 
+
+
+# === 1. Image Folder Dataset + SAM2 Segment Generation === #
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+root_dir = '/gpfs/helios/home/mahmouds/Thesis/data/ILSVRC2012/segmentation'
+segment_root = 'segment_dataset/segments/centralized_segments'
+os.makedirs(segment_root, exist_ok=True)
+
+# Transform for SAM input and fine-tuned for DINO
+SAM_transform = transforms.Compose([transforms.Resize((224, 224))])
+dino_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+# Load original dataset using ImageFolder
+imagenet_dataset = datasets.ImageFolder(root=root_dir, transform=SAM_transform)
+
+
+# configuring the CLIP 
+clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)#ViT-B/32 ViT-L/14
+target_classes = ["basketball","moving van","mountain bike","all-terrain bike","van","off-roader"]
+text_tokens = clip.tokenize(target_classes).to(device)
+DATASET_TO_CLIP = {
+    "basketball": {"basketball"},
+    "mountain bike": {"mountain bike", "all-terrain bike", "off-roader"},
+    "moving van": {"moving van"},
+}
+with torch.no_grad():
+        text_features = clip_model.encode_text(text_tokens)
+        text_features /= text_features.norm(dim=-1, keepdim=True)
+		
+sam2_checkpoint = "/gpfs/helios/home/mahmouds/sam2/checkpoints/sam2.1_hiera_large.pt"
+model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+sam2 = build_sam2(model_cfg, sam2_checkpoint, device=device)
+mask_gen = SAM2AutomaticMaskGenerator(
+    model=sam2,                        # The pretrained SAM2 model used to generate masks.
+
+    predicted_iou_thresh=0.88,        # Minimum predicted Intersection-over-Union (IoU) score required
+                                      # for a mask to be kept. Higher = more confident masks.
+                                      # Filters out masks the model is uncertain about.
+
+    stability_score_thresh=0.8,       # Filters out masks with unstable boundaries (i.e., change a lot with small perturbations).
+                                      # Ranges from 0 to 1. Higher = more stable and cleaner masks.
+
+    box_nms_thresh=0.5,               # Non-Maximum Suppression (NMS) threshold for overlapping masks.
+                                      # Helps remove redundant overlapping boxes.
+                                      # Lower values = more aggressive suppression.
+
+    crop_n_layers=0,                  # Number of image crops/layers for multiscale segmentation.
+                                      # 0 = no cropping (single full image), 1 or more = better at small details,
+                                      # but slower. Useful for high-res images or small objects.
+
+    min_mask_region_area=256,         # Small mask regions (in pixel count) below this area are discarded.
+                                      # Helps remove tiny artifacts or noise.
+                                      # Increase this value to filter out clutter.
+
+    max_num_masks=30,                 # Maximum number of masks to return per image.
+                                      # Controls memory and computation cost.
+)
+
+
+print("🔧 Starting SAM2 segmentation and saving segments with metadata...")
+
+for img_idx, (image_tensor, label) in tqdm(enumerate(imagenet_dataset), total=len(imagenet_dataset)):
+    orig_img_path, _ = imagenet_dataset.samples[img_idx]
+    img_pil = Image.open(orig_img_path).convert("RGB")
+    img_np = np.array(img_pil)
+
+    try:
+        masks = mask_gen.generate(img_np)
+    except Exception as e:
+        print(f"❌ Failed segmentation on {orig_img_path}: {e}")
+        continue
+
+    segments, scores, bboxes = [], [], []
+    for m in masks:
+        mask = m["segmentation"].astype(bool)
+        seg = img_np.copy()
+        seg[~mask] = 0
+        segments.append(seg)
+        scores.append(m["predicted_iou"])
+        bboxes.append(get_bbox_from_mask(mask))
+    class_name = imagenet_dataset.classes[label]
+    class_dir = os.path.join(segment_root, class_name)
+    save_segments_with_metadata(
+        image_id=img_idx,
+        original_label=label,
+        segments=segments,
+        scores=scores,
+        bboxes=bboxes,
+        orig_img_path=orig_img_path,
+        output_dir=class_dir,
+        score_threshold=0.65,
+    )
+print("✅ SAM2 segmentation complete.")
+print ("Start feature extraction ")
+
+# === 2. Create Segment Dataset Consuming Saved Segments + Metadata === #        
+segment_dataset = SegmentDataset(segment_root=segment_root, transform=dino_transform)
+print(segment_dataset.get_stats())
+segment_loader = DataLoader(segment_dataset, batch_size=512, shuffle=False, num_workers=0,collate_fn=custom_collate)
+
+# === 3. DINOv2 Feature Extraction === #
+
+dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').to(device).eval()
+features,labels, metas = extract_features_dinov2(segment_loader, dinov2, device)
+
+print(f"[Client] Extracted features: {features.shape}, Labels: {len(labels)}")
+data = {'features': features, 'labels': labels, 'metas': metas}
+with open(f'segment_dataset/segments/centralized_segments/precomputed_data.pkl', 'wb') as f:
+                pickle.dump(data, f)
+
+
+#print(f"Attempting to load pickle file...") 
+#with open(f'segment_dataset/segments/centralized_segments/precomputed_data.pkl', 'rb') as f:
+#            data = pickle.load(f)
+#features = data['features']
+#labels = data['labels']
+#metas = data['metas']
+# DEBUG HELPERS
+def log(msg):
+    print(f"\n[DEBUG] {msg}")
+
+# Organize features and metas per class
+class_feature_map = defaultdict(list)
+class_meta_map = defaultdict(list)
+
+for f, m in zip(features, metas):
+    class_label = m['original_label']
+    class_feature_map[class_label].append(f)
+    class_meta_map[class_label].append(m)
+
+log(f"Discovered {len(class_feature_map)} unique classes")
+
+final_clusters = []
+final_info = []
+K = 15
+n_keep = 40
+clip_threshold = 0.5
+
+label_to_classname = {i: name for i, name in enumerate(imagenet_dataset.classes)}
+for class_label in class_feature_map:
+    features_class = np.stack(class_feature_map[class_label])
+    metas_class = class_meta_map[class_label]
+
+    log(f"\n🔍 Class {class_label}: {features_class.shape[0]} segments")
+
+    if features_class.shape[0] < K:
+        log(f"Skipping class {class_label} due to insufficient samples for clustering")
+        continue
+
+    # Clustering for this class
+    kmeans = KMeans(n_clusters=K, random_state=42)
+    kmeans.fit(features_class)
+    labels = kmeans.labels_
+    centers = kmeans.cluster_centers_
+
+    # Group and keep top-N per cluster
+    clusters_kept = []
+    for idx in range(K):
+        cluster_indices = np.where(labels == idx)[0]
+        if len(cluster_indices) == 0:
+            continue
+        dists = np.sum((features_class[cluster_indices] - centers[idx]) ** 2, axis=1)
+        keep_indx = np.argsort(dists)[:min(n_keep, len(dists))]
+        clusters_kept.append([metas_class[cluster_indices[j]] for j in keep_indx])
+
+    # Filtering by frequency/popularity within the class
+    num_discovery_images = len(set(m['original_image_index'] for m in metas_class))
+    log(f"{num_discovery_images} unique discovery images for class {class_label}")
+
+    for c_id, cluster in enumerate(clusters_kept):
+        img_indices = [m['original_image_index'] for m in cluster] #filtered_cluster
+        unique_imgs = set(img_indices)
+        cluster_size = len(cluster) #filtered_cluster
+        num_unique_imgs = len(unique_imgs)
+        clip_scores = [m['clip_score'] for m in cluster]  # 'score' should hold CLIP similarity #filtered_cluster
+        mean_clip_score = np.mean(clip_scores) if clip_scores else 0
+        
+        # Simplified relaxed filtering
+        keep = num_unique_imgs >= 10 or cluster_size >= 30 and mean_clip_score > 0.75#(num_unique_imgs >= 30 and mean_clip_score > clip_threshold) or mean_clip_score > 0.6
+        #has_clip_match = any(
+        #    m["clip_class"].lower() == true_class_name for m in cluster
+        #)
+        log(f"Class {class_label} Cluster {c_id}: size={cluster_size}, unique_imgs={num_unique_imgs}, mean_clip_score={mean_clip_score:.3f}, keep={keep}")
+        
+        for meta in cluster:
+                meta["cluster_id"] = c_id
+        final_clusters.append(cluster) 
+        final_info.append({
+                "class_label": class_label,
+                "cluster_id": c_id,
+                "num_members": cluster_size,
+                "num_images": num_unique_imgs,
+                "mean_clip_score": mean_clip_score
+            })
+
+
+clusters_by_class = defaultdict(list)
+for cluster, info in zip(final_clusters, final_info):
+    if not cluster or "original_label" not in cluster[0]:
+        continue  # skip malformed clusters
+
+    class_id = cluster[0]["original_label"]
+    class_name = label_to_classname[class_id]
+    cluster_id = info["cluster_id"]
+
+    # Sort cluster by CLIP score (highest first)
+    sorted_cluster = sorted(cluster, key=lambda m: m["clip_score"], reverse=True)
+
+    # Skip cluster if all CLIP scores are below threshold
+    if all(m["clip_score"] < 0.6 for m in sorted_cluster):
+        continue
+
+    # Append to clusters_by_class
+    clusters_by_class[class_name].append((sorted_cluster, {"cluster_id": cluster_id}))
+
+for class_label, clusters in clusters_by_class.items():
+    log(f"\n #############--------------->>>> Class {class_label}: {len(clusters)} clusters<<<<<<--------------------##################")
+    for cid, (cluster_metas, info) in enumerate(clusters):
+        plot_cluster_4x4(cluster_metas, cid, class_label)
+visualize_clusters_with_overlay_and_arrow(clusters_by_class, max_per_cluster=4)
+visualize_clusters_umap_3d(clusters_by_class)
+
+inception_model = inception_v3(weights='IMAGENET1K_V1').to(device)
+inception_model.eval()
+
+
+inception_features = {}
+def hook_fn(module, input, output):
+    inception_features['mixed_8'] = output.detach()
+
+
+# Preprocessing for Inception
+inception_preproc = transforms.Compose([
+    transforms.Resize((299, 299)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
+inception_model.Mixed_7b.register_forward_hook(hook_fn)
+inception_model.Mixed_7b.register_backward_hook(save_gradient)
+# ---  Feature Extraction Function ---
+
+def extract_mixed8_features(segment_metas):
+            images = []
+            feats = []
+            for meta in segment_metas:
+                img_path = meta['img_path']
+                img = Image.open(img_path).convert('RGB')
+                img_tensor = inception_preproc(img)
+                images.append(img_tensor)
+            if not images:
+                return np.zeros((0, 1280))
+            batch_size = 512
+            for i in range(0, len(images), batch_size):
+                batch=torch.stack(images[i:i + batch_size]).to(device)
+                with torch.no_grad():
+                    _ = inception_model(batch)
+                    batch_feats = inception_features['mixed_8'].mean(dim=[2, 3])
+                feats.append(batch_feats.cpu().numpy())    
+                torch.cuda.empty_cache()
+            return np.concatenate(feats, axis=0)
+
+
+
+# ---  CAV Calculation Function ---
+def calculate_cav(concept_features, random_features):
+    X = np.concatenate([concept_features, random_features], axis=0)
+    y = np.array([1]*len(concept_features) + [0]*len(random_features))
+    clf = LogisticRegression(max_iter=1000)
+    clf.fit(X, y)
+    cav = clf.coef_[0]
+    cav= cav / np.linalg.norm(cav)
+    mean_pos = np.mean(np.dot(concept_features, cav))
+    mean_neg = np.mean(np.dot(random_features, cav))
+    if mean_pos < mean_neg:
+                cav = -cav
+    return cav
+
+
+
+# ---   Construct Cluster CAVs with inter and intra class Negative Sampling ---
+cluster_cavs = {}  
+
+for class_label, clusters in clusters_by_class.items():
+    for  (cluster_metas, info) in clusters:
+        cluster_id = info["cluster_id"]
+        concept_metas = cluster_metas
+
+        # --- Negative set: ---
+        # (a) All other clusters from the same class, except the current cluster
+        other_same_class_metas = []
+        for c_metas, c_info in clusters:
+            if c_info["cluster_id"] != cluster_id:
+                other_same_class_metas.extend(c_metas)  # This keeps the list flat!
+
+        # (b) All clusters from other classes
+        other_class_metas = []
+        for other_label, other_cls_clusters in clusters_by_class.items():
+            if other_label != class_label:
+                for c_metas, _ in other_cls_clusters:
+                    other_class_metas.extend(c_metas)
+
+        # --- Sampling (avoid sampling more than available) ---
+        n_pos = len(concept_metas)
+        n_neg = n_pos     # Or any ratio you want
+        n_same = min(n_neg // 2, len(other_same_class_metas))
+        n_other = min(n_neg - n_same, len(other_class_metas))
+
+        random_same_class = random.sample(other_same_class_metas, n_same) if n_same > 0 else []
+        random_other_class = random.sample(other_class_metas, n_other) if n_other > 0 else []
+        random_metas = random_same_class + random_other_class  # Concatenate, flat!
+
+        if not random_metas:
+            print(f"Warning: No negatives for class {class_label}, cluster {cluster_id}")
+            continue
+
+        # Extract the needed features from the model need to be explained 
+        concept_features = extract_mixed8_features(concept_metas)
+        random_features = extract_mixed8_features(random_metas)
+
+        
+        # calculate the CAV 
+        
+        cav = calculate_cav(concept_features, random_features)
+        cluster_cavs[(class_label, cluster_id)] = cav
+        print(f"CAV computed for class {class_label} cluster {cluster_id} | Pos:{len(concept_features)} Neg:{len(random_features)}")
+# --- Gradient hook storage ---
+gradients = {}
+inception_features.clear()
+
+
+
+# Register backward hook for gradients
+handle_grad = inception_model.Mixed_7b.register_backward_hook(save_gradient)
+
+# -------------------------------------------------------
+# Load test images by class from test/ directory
+# -------------------------------------------------------
+def load_test_images_by_class(test_dir):
+    class_images = {}
+    for class_label in os.listdir(test_dir):
+        if class_label.startswith('.'):
+            continue
+        class_path = os.path.join(test_dir, class_label)
+        if not os.path.isdir(class_path):
+            continue
+        imgs = []
+        for fname in os.listdir(class_path):
+            if fname.lower().endswith(('png', 'jpg', 'jpeg')):
+                img = Image.open(os.path.join(class_path, fname)).convert('RGB')
+                imgs.append(img)
+        class_images[class_label] = imgs
+    return class_images
+
+
+# -------------------------------------------------------
+# Get gradient and activation for a single image
+# -------------------------------------------------------
+def get_mixed8_gradients(img, target_class_idx):
+    inception_features.clear()
+    gradients.clear()
+    tensor = inception_preproc(img).unsqueeze(0).to(device)
+    tensor.requires_grad_(True)
+    output = inception_model(tensor)
+    target_logit = output[:, target_class_idx]
+    inception_model.zero_grad()
+    target_logit.backward()
+    grad = gradients['mixed_8'].detach().cpu().numpy().squeeze()
+    grad_pooled = grad.mean(axis=(1,2))
+    return grad_pooled
+
+
+# -------------------------------------------------------
+# Compute TCAV score
+# -------------------------------------------------------
+def compute_tcav_score_for_class(class_images, cav, target_class_idx):
+    pos = 0
+    for img in class_images:
+        grad_pooled = get_mixed8_gradients(img, target_class_idx)
+        grad_pooled = grad_pooled / np.linalg.norm(grad_pooled)
+        if np.dot(grad_pooled, cav) > 0:
+            pos += 1
+    return pos / len(class_images)
+
+
+# -------------------------------------------------------
+# Main TCAV loop for all clusters
+# -------------------------------------------------------
+def run_tcav_for_all_clusters(clusters_by_class, cluster_cavs, test_dir, model, device):
+    """
+    clusters_by_class: dict[class_label] -> list of clusters
+    cluster_cavs: dict[(class_label, cluster_id)] -> cav_vector
+    """
+    # Load test images by class
+    test_images_by_class = load_test_images_by_class(test_dir)
+
+    tcav_scores = {}
+    class_to_inception_idx = {
+            'basketball': 816,
+            #'corn ears': 499,
+            #'electric ray': 445,
+            'mountain bike': 162,
+            'moving van': 191
+            #'soccer ball': 817
+        }
+    for class_label, clusters in clusters_by_class.items():
+        if class_label not in test_images_by_class:
+            print(f"No test images for class {class_label}")
+            continue
+
+        
+        if class_label not in class_to_inception_idx:
+            print(f"⚠️ No mapping found for {class_label}, skipping.")
+            continue
+        target_idx = class_to_inception_idx[class_label]  
+
+        # Evaluate each cluster
+        for cluster_id in range(len(clusters)):
+            cav = cluster_cavs[(class_label, cluster_id)]
+            score = compute_tcav_score_for_class(
+                test_images_by_class[class_label],
+                cav,
+                model,
+                target_idx,
+                device
+            )
+            tcav_scores[(class_label, cluster_id)] = score
+            print(f"TCAV score for class {class_label} cluster {cluster_id}: {score:.3f}")
+
+    return tcav_scores
+
+
+# -------------------------------------------------------
+# TCAV heatmap(s)
+# -------------------------------------------------------
+test_dir = '/gpfs/helios/home/mahmouds/Thesis/Test'
+
+class_to_inception_idx = {
+    'basketball': 816,
+    'mountain bike': 162,
+    'moving van': 191
+}
+
+# Load test images per class
+test_images = load_test_images_by_class(test_dir)  # {class_name: [PIL images]}
+# Columns = only classes we can actually score (have images AND inception idx)
+class_labels = sorted([c for c in test_images.keys() if c in class_to_inception_idx])
+
+# Rows = all (class, cluster_id) pairs we have CAVs for
+clusters = list(cluster_cavs.keys())  # list of (class_label, cid)
+cluster_labels = [f"{label_to_classname.get(cl, cl)}-C{cid}" for cl, cid in clusters]
+
+# Build the full matrix once
+tcav_matrix = np.full((len(clusters), len(class_labels)), np.nan, dtype=float)
+
+for i, (concept_class, cid) in enumerate(clusters):
+    for j, test_class in enumerate(class_labels):
+        # skip if either side is missing (shouldn't happen with filtered class_labels)
+        if test_class not in test_images or test_class not in class_to_inception_idx:
+            continue
+        score = compute_tcav_score_for_class(
+            test_images[test_class],
+            cluster_cavs[(concept_class, cid)],
+            class_to_inception_idx[test_class]
+        )
+        tcav_matrix[i, j] = score
+
+# One heatmap per concept class (like your screenshot)
+unique_classes = sorted({cl for (cl, _) in clusters})
+
+# Make NaNs grey inside the plotter
+def plot_tcav_heatmap(tcav_sub, class_labels, row_labels, concept_class):
+    import matplotlib
+    fig, ax = plt.subplots(figsize=(1.2 * len(class_labels) + 2, 0.8 * len(row_labels) + 3))
+    cmap = plt.get_cmap('RdYlGn').copy()
+    cmap.set_bad(color='lightgrey')  # NaNs look grey
+    im = ax.imshow(tcav_sub, cmap=cmap, vmin=0., vmax=1.)
+    # annotate
+    for r in range(tcav_sub.shape[0]):
+        for c in range(tcav_sub.shape[1]):
+            v = tcav_sub[r, c]
+            if not np.isnan(v):
+                ax.text(c, r, f"{v:.2f}", ha='center', va='center',
+                        color="black" if v < 0.5 else "white", fontsize=9)
+    ax.set_xticks(np.arange(len(class_labels)))
+    ax.set_xticklabels(class_labels, rotation=45, ha="right")
+    ax.set_yticks(np.arange(len(row_labels)))
+    ax.set_yticklabels(row_labels)
+    ax.set_xlabel("Class label")
+    ax.set_ylabel("Concept (Cluster)")
+    plt.title(f"TCAV class {concept_class} Concepts Contribution", pad=18)
+    plt.colorbar(im, ax=ax, fraction=0.045)
+    os.makedirs("cluster_visualizations", exist_ok=True)
+    out_path = f"cluster_visualizations/centralized/TCAV_heatmap_class_{concept_class.replace(' ', '_')}.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+for concept_class in unique_classes:
+    # pick rows that belong to this concept_class
+    rows_idx = [idx for idx, (cl, _) in enumerate(clusters) if cl == concept_class]
+    if not rows_idx:
+        continue
+    submatrix = tcav_matrix[rows_idx, :]
+    sub_cluster_labels = [cluster_labels[idx] for idx in rows_idx]
+    plot_tcav_heatmap(submatrix, class_labels, sub_cluster_labels, concept_class)
+
+
